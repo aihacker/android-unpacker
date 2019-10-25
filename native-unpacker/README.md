@@ -8,6 +8,7 @@ Currently supports:
  - APKProtect
  - LIAPP (prerelease demo)
  - Qihoo Android Packers
+ - Jaigu
 
 This _should_ work on ARM and x86 devices. Please note that ptrace can and often is disabled or messed up on newer SELinux devices. You should either use a device/emulator which does not have SELinux enabled or disable it prior to ruinning this.
 
@@ -24,7 +25,7 @@ The only prerequisite for the unpacker to build is to have the Android NDK [inst
 
 2. Push to the device
 <pre>
-      $ make install
+      $ make install abi={armeabi-v7a, arm64-v8a, x86, x86_64}
 </pre>
 
 2. Run the APK to unpack and then run the unpacker

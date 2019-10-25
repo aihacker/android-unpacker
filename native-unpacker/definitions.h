@@ -24,11 +24,28 @@ static packer packers[] = {
 
   // Bangcle (??) or something equally silly
   {
-    "Bangcle (??) silly version",
+    "Bangcle (?) silly version",
     "Something silly used by malware",
     "/app_lib/classes.dex",
     "/app_lib/"
   },
+
+  {
+    "Bangle SGMain version",
+    "A seemingly one off of Bangcle (SecNeo)",
+    "/libsgmain_",
+    "/libsgmain.so"
+  },
+
+  /*
+  // Jaigu
+  {
+    "Jaigu",
+    "Jaigu generic unpacker",
+    "/.jiagu/libjiagu.so",
+    // Always after the last dalvik cache
+  },
+  */
 
   // LIAPP
   {

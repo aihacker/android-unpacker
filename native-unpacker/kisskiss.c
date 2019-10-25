@@ -11,9 +11,10 @@
  *     - APKProtect (native versions w/ crypto)
  *     - LIAPP (prereleased demo)
  *     - Qihoo Packer
+ *     - Jiagu
  *
  *
- * This will dump the optimized dex (odex) file from
+ * This will dump the dex or optimized dex (odex) files from
  * the system, meaning you will have to pull the
  * framework files to be able to deodex (in needed)
  * for the original dex file.
@@ -24,7 +25,6 @@
  */
 
 #include "kisskiss.h"
-#include "definitions.h"
 
 int main(int argc, char *argv[]) {
 
@@ -50,6 +50,8 @@ int main(int argc, char *argv[]) {
   }
   printf(" [+] %d is service pid\n", pid);
 
+  uint32_t tracer = checkTracer(pid);
+
   uint32_t clone_pid = get_clone_pid(pid);
   if(clone_pid <= 0) {
     printf(" [!] A suitable clone process could not be found!");
@@ -57,34 +59,109 @@ int main(int argc, char *argv[]) {
   }
   printf(" [+] %d is clone pid\n", clone_pid);
 
+  uint32_t clone_tracer = checkTracer(clone_pid);
+
   int mem_file = attach_get_memory(clone_pid);
   if(mem_file == -1) {
-    printf(" [!] An error occurred attaching and finding the memory!\n");
+    perror(" [!] An error occurred attaching and finding the memory ");
     return -1;
   }
 
   // Determine if we are dealing with APKProtect or Bangcle
-  char *extra_filter = determine_filter(clone_pid, mem_file);
+  packer *found_packer = determine_packer(clone_pid, mem_file);
+  if(found_packer == NULL) {
+    printf("  [*] No packer found on clone_pid %d, falling back to service_pid %d\n", clone_pid, pid);
+    mem_file = attach_get_memory(pid);
+    if(mem_file == -1) {
+      perror(" [!] An error occurred attaching and finding the memory ");
+      return -1;
+    }
 
-  memory_region memory;
-  if(find_magic_memory(clone_pid, mem_file, &memory, extra_filter) <= 0) {
+    found_packer = determine_packer(pid, mem_file);
+  }
+  if(found_packer != NULL && strcmp(found_packer->name, "Bangle Test") == 0) {
+    printf("  [+] Since filter is Bangle Test, switching to look at the pid attached to service_pid, %d\n", tracer);
+    clone_pid = tracer;
+    mem_file = attach_get_memory(clone_pid);
+    if(mem_file == -1) {
+      perror(" [!] An error occurred attaching and finding the memory ");
+      return -1;
+    }
+  }
+
+  char *filter = NULL;
+  if(found_packer != NULL) {
+    filter = found_packer->filter;
+  }
+
+  memory_region *memory[128] = { 0, 0 };
+  int found = find_magic_memory(clone_pid, mem_file, memory, filter);
+  if(found <= 0) {
     printf(" [!] Something unexpected happened, new version of packer/protectors? Or it wasn't packed/protected!\n");
     return -1;
   }
-  printf(" [+] Unpacked odex found in memory!\n");
 
-  // Build a safe file to dump to and call the memory dumping function
-  char *dumped_file_name = malloc(strlen(static_safe_location) + strlen(package_name) + strlen(suffix));
-  sprintf(dumped_file_name, "%s%s%s", static_safe_location, package_name, suffix);
-  if(dump_memory(mem_file, &memory, dumped_file_name) <= 0) {
-    printf(" [!] An issue occurred trying to dump the memory to a file!\n");
-    return -1;
+  char class_path[strlen(package_name)];
+  strncpy(class_path, package_name, strlen(package_name) + 1);
+  replaceAll(class_path, (char) '.', (char) '/');
+
+  printf(" [+] Found %d potentially interesting memory locations...\n", found);
+  int output = 0;
+  for(int i = 0; i < found; i++) {
+    // Build a safe file to dump to and call the memory dumping function
+    char *dumped_file_name = malloc(strlen(static_safe_location) + strlen(package_name) + strlen(suffix) + 1 /* _ */ + (found == 0 ? 1 : (int) (log10(found) + 1) + 1));
+    sprintf(dumped_file_name, "%s%s%s_%d", static_safe_location, package_name, suffix, output);
+    int result = dump_memory(class_path, mem_file, memory[i], dumped_file_name, (found_packer != NULL));
+    if(result < 0) {
+      perror(" [!] An issue occurred trying to dump the memory to a file ");
+      return -1;
+    } else if(result == 0) {
+      // Potential system dex file
+    } else {
+      printf(" [+] Unpacked/protected file dumped to : %s\n", dumped_file_name);
+      output++;
+    }
   }
-  printf(" [+] Unpacked/protected file dumped to : %s\n", dumped_file_name);
-
   close(mem_file);
   ptrace(PTRACE_DETACH, clone_pid, NULL, 0);
   return 1;
+}
+
+uint32_t checkTracer(uint32_t pid) {
+  char status[1024];
+  snprintf(status, sizeof(status), "/proc/%u/status", pid);
+  FILE *status_file = NULL;
+
+  if((status_file = fopen(status, "r")) == NULL) {
+    perror("  [!] Unable to check status of pid ");
+    return -1;
+  }
+
+  char key[1024];
+  uint32_t value;
+  uint32_t tracerpid = 0;
+  while(fscanf(status_file, "%s\t%u\n", key, &value) >= 0) {
+    if(strcmp(key, "TracerPid:") == 0 && value != 0) {
+      printf("  [*] Warning, process %u seems to be traced by %d, likely an anti-debug trick!\n", pid, value);
+      tracerpid = value;
+    }
+  }
+
+  fclose(status_file);
+  return tracerpid;
+}
+
+void replaceAll(char* str, char oldChar, char newChar) {
+    int i = 0;
+    while(str[i] != '\0') {
+        if(str[i] == oldChar)
+            str[i] = newChar;
+        i++;
+    }
+}
+
+int checkFd(int fd) {
+  return fcntl(fd, F_GETFD) != -1 || errno != EBADF;
 }
 
 /*
@@ -168,7 +245,7 @@ uint32_t get_process_pid(const char *target_package_name) {
  * Extremely weak filtering process, looks for known shared libs
  * that are mapped to memory.
  */
-char *determine_filter(uint32_t clone_pid, int memory_fd) {
+packer *determine_packer(uint32_t clone_pid, int memory_fd) {
   char maps[1024];
   snprintf(maps, sizeof(maps), "/proc/%d/maps", clone_pid);
 
@@ -184,24 +261,25 @@ char *determine_filter(uint32_t clone_pid, int memory_fd) {
     // Iterate through all markers to find proper filter
     int i;
     for(i = 0; i < sizeof(packers) / sizeof(packers[0]); i++) {
-      if(strstr(mem_line, packers[i].marker)) {
+      if(strstr(mem_line, packers[i].marker) != NULL) {
 	printf("  [*] Found %s\n", packers[i].name);
-	return packers[i].filter;
+	return &packers[i];
       }
     }
   }
-  printf("  [*] Nothing special found, assuming Bangcle...\n");
-  // For now we assume it's Bangcle if above filters failed
+  printf("  [*] Nothing special found, hunting for all dex and odex magic bytes...\n");
 
   return NULL;
 }
+
 /*
  * Find the "magic" memory location we want, usually an odex so we are currently
  * recursing through the /proc/pid/maps and peeopling at memory locations using
  * the peek_memory function.
+ *
+ * returns number of interesting memory locations found
  */
-int find_magic_memory(uint32_t clone_pid, int memory_fd, memory_region *memory, char *extra_filter) {
-  int ret = 0;
+int find_magic_memory(uint32_t clone_pid, int memory_fd, memory_region *memory[], char *extra_filter) {
   char maps[1024];
   snprintf(maps, sizeof(maps), "/proc/%d/maps", clone_pid);
 
@@ -210,77 +288,129 @@ int find_magic_memory(uint32_t clone_pid, int memory_fd, memory_region *memory, 
     return -1;
 
   // Scan the /proc/pid/maps file and find possible memory of interest
+  // Currently this loops until we find the /last/ odex file which is usually correct
   char mem_line[1024];
+  int found = 0;
   while(fscanf(maps_file, "%[^\n]\n", mem_line) >= 0) {
 
     // For APKProtect we want the odex file that is mapped to memory
     // so we are looking for an extra_filter match on the odex
-    if(extra_filter != NULL && !strstr(mem_line, extra_filter))
+    if(extra_filter != NULL && strstr(mem_line, extra_filter) == NULL) {
       continue;
+    }
 
     // Otherwise we are looking for the location that bangcle allocates the odex to,
     // this is a very ugly way to just try and get the directly mapped meory
-    if(extra_filter == NULL && (strstr(mem_line, "/") || strstr(mem_line, "[")))
+    if(extra_filter == NULL && (strstr(mem_line, "/") != NULL || strstr(mem_line, "[") != NULL))
       continue;
 
     char mem_address_start[10];
     char mem_address_end[10];
     sscanf(mem_line, "%8[^-]-%8[^ ]", mem_address_start, mem_address_end);
 
-    uint32_t mem_start = strtoul(mem_address_start, NULL, 16);
+    uint64_t mem_start = strtoul(mem_address_start, NULL, 16);
+
     // Peek and see if the memory is what we wanted
-    if(peek_memory(memory_fd, mem_start)) {
-      memory->start = mem_start;
-      memory->end = strtoul(mem_address_end, NULL, 16);
-      ret = 1;
+    off64_t offset = peek_memory(memory_fd, mem_start);
+    // If we had a filter and didn't find a dex or odex, just return it anyway
+    // This allows us to return non-dex file things (like an apk, jar or zip)
+    if(extra_filter != NULL && offset < 0)
+      offset = 0;
+
+    if(offset >= 0) {
+      // Found a magic
+      memory[found] = malloc(sizeof(memory_region));
+      memory[found]->start = mem_start + offset;
+      memory[found++]->end = strtoull(mem_address_end, NULL, 16);
+    } else if(offset == -99) {
+      // No offset found
+    } else {
+      perror(" [!] Error peeking at memory ");
     }
   }
 
   fclose(maps_file);
-  return ret;
+  return found;
 }
 
 // Just peek at the memory to see if it contains an odex we want
-int peek_memory(int memory_file, uint32_t address) {
-  char magic[8];
+// return value is the offset into memory of magic being found
+off64_t peek_memory(int memory_file, uint64_t address) {
+  char buffer[8];
 
-  if(8 != pread(memory_file, magic, 8, address))
+  int read = pread64(memory_file, buffer, 8, address);
+  if(read < 0) {
+    fprintf(stderr, "  [!] pread seems to have failed at 0x%llx\n", address);
     return -1;
+  }
 
+  if(read != 8) {
+    return -1;
+  }
   // We are currently just dumping odex or jar files, letting the packers/protectors do all
   // the heavy lifting for us
-  if(strcmp(magic, odex_magic) == 0)
-    return 1;
+  char* result = strstr(buffer, dex_magic);
+  if(result != NULL)
+    return result - buffer;
 
-  return 0;
+  result = strstr(buffer, odex_magic);
+  if(result != NULL)
+    return result - buffer;
+
+  return -99;
 }
 
 /*
  * Dump a given memory location via a file descriptor, "memory_region"
  * and a given file_name for output.
  */
-int dump_memory(int memory_fd, memory_region *memory, const char *file_name) {
-  int ret;
+int dump_memory(char* class_path, int memory_fd, memory_region *memory, const char *file_name, int ignore_class_path) {
+  int ret = 0;
   char *buffer = malloc(memory->end - memory->start);
 
-  printf(" [+] Attempting to dump memory region 0x%x to 0x%x\n", memory->start, memory->end);
+  printf(" [+] Attempting to search inside memory region 0x%llx to 0x%llx\n", memory->start, memory->end);
 
-  int read = pread(memory_fd, buffer, memory->end - memory->start, memory->start);
-  if((memory->end - memory->start) != read) {
-    printf(" [!] pread seems to have failed!\n");
+  if(checkFd < 0) {
+    perror("  [!] Appears to be an issue with memory fd ");
     return -1;
   }
 
-  FILE *dump = fopen(file_name, "wb");
-  if(fwrite(buffer, memory->end - memory->start, 1, dump) <= 0) {
+  ssize_t read = pread64(memory_fd, buffer, (size_t)(memory->end - memory->start), (off64_t)(memory->start));
+  if(read < 0) {
+    fprintf(stderr, "  [!] pread seems to have failed for 0x%llx to 0x%llx\n", memory->start, memory->end);
+    return -1;
+  }
+
+  if((memory->end - memory->start) != read) {
+    printf("  [!] pread did not read the expected amount of memory!\n");
+    return -1;
+  }
+
+  off64_t *contained_offset = memmem(buffer, (size_t)(memory->end - memory->start), class_path, strlen(class_path));
+
+  FILE *dump = NULL;
+
+  if(contained_offset != NULL || ignore_class_path == 1) {
+    if(contained_offset != NULL)
+      printf("  [+] Memory region 0x%llx to 0x%llx contained anticipated class path %s\n", memory->start, memory->end, class_path);
+
+    FILE *dump = fopen(file_name, "wb");
     ret = -1;
+    if(dump != NULL) {
+      if(fwrite(buffer, memory->end - memory->start, 1, dump) > 0) {
+	ret = 1;
+      }
+
+      fclose(dump);
+    } else {
+      perror("  [!] Error opening a file to write ");
+    }
   } else {
-    ret = 1;
+    printf("  [-] Likely a system file found, ignoring...\n");
+    ret = 0;
   }
 
   free(buffer);
-  fclose(dump);
-
   return ret;
 }
 
